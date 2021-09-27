@@ -1,89 +1,222 @@
 #include "featurelibrary.h"
 
-#include "json/json.h"
 #include "config.h"
+#include "json/json-schema/json-schema.hpp"
 
+#include "rule/rule.h"
+
+using namespace nlohmann;
+using nlohmann::json_schema::json_validator;
+
+using namespace mountcloud;
 using namespace firedog;
 using namespace std;
 
-int FeatureLibrary::loadByJson(string json) {
-	Json::CharReaderBuilder rbuilder;
-	rbuilder["collectComments"] = false;
 
-	string errs;
-	stringstream ss;
-	ss << json;
+FeatureLibrary::FeatureLibrary() {
+	items = new std::vector<FeatureLibraryItem*>();
+}
 
-	Json::Value root;
-	bool ok = Json::parseFromStream(rbuilder, ss, &root, &errs);
+FeatureLibrary::~FeatureLibrary() {
+	if (items != NULL) {
+		for (int i = 0; i < items->size(); i++) {
+			FeatureLibraryItem* item = items->at(i);
+			delete item;
+			item = NULL;
+		}
+	}
+}
 
-	if (!ok || errs.size() > 0 || !root.isObject()) {
-		return FL_CONTENT_FORMATE_ERROR;
+FeatureLibrary* FeatureLibrary::createByJson(string json, int* errorcode) {
+	FeatureLibrary* result = NULL;
+	nlohmann::json root;
+	bool parseStatus = false;
+	try {
+		root = json::parse(json);
+		parseStatus = true;
+	}
+	catch (nlohmann::detail::parse_error er) {
+		parseStatus = false;
+
+	}
+	if (!parseStatus || !root.is_object()|| !root.contains("version") || !root.contains("items")) {
+		*errorcode = FL_CONTENT_FORMATE_ERROR;
+		return result;
 	}
 
-	//check content
-	if (!root.isMember("version") || !root["version"].isString()
-		|| !root.isMember("author") || !root["author"].isString()
-		|| !root.isMember("createTime") || !root["createTime"].isString()
-		|| !root.isMember("hexItems") || !root["hexItems"].isArray()
-		|| !root.isMember("md5Items") || !root["md5Items"].isArray()
-		|| !root.isMember("textItems") || !root["textItems"].isArray()) {
-		return FL_CONTENT_FORMATE_ERROR;
-	}
+	bool validstate = false;
+	auto schema = json::parse(FIREDOG_FEATURE_LIBRARAY_JSON_SCHEMA);
 
+	json_validator validator; // create validator
+	validator.set_root_schema(schema);
+	try {
+		validator.validate(root);
+		validstate = true;
+	}
+	catch (const std::exception& e) {
+		validstate = false;
+	}
+	
+	if (!validstate) {
+		*errorcode = FL_CONTENT_FORMATE_ERROR;
+		return result;
+	}
+	
 	//get version
-	string version = root["version"].asString();
+	string version = root["version"];
 
 	//check version
 	if (version != FIREDOG_FEATURE_LIBRARY_VERSION) {
-		return FL_CONTENT_VERSION_ERROR;
+		*errorcode = FL_CONTENT_VERSION_ERROR;
 	}
 
-	
-	this->version = version;
+	result = new FeatureLibrary();
 
-	this->author = root["author"].asString();
-	this->createTime = root["createTime"].asString();
+	result->version = version;
 
-	Json::Value hexItems = root["hexItems"];
-	this->parseJson(&this->hexItems, hexItems);
+	nlohmann::json items = root["items"];
 
-	Json::Value md5Items = root["md5Items"];
-	this->parseJson(&this->md5Items, md5Items);
+	if (items.is_array()) {
+		for (int i = 0; i < items.size(); i++) {
+			nlohmann::json item = items[i];
+			if (item.is_object()
+				&& item.contains("author") && item["author"].is_string()
+				&& item.contains("name") && item["name"].is_string()
+				&& item.contains("describe") && item["describe"].is_string()
+				&& item.contains("features") && item["features"].is_array() && item["features"].size() > 0
+				&& item.contains("rule") && item["rule"].is_object()) {
+				
+				//先看规则
+				nlohmann::json rulejson = item["rule"];
 
-	Json::Value textItems = root["textItems"];
-	this->parseJson(&this->textItems, textItems);
+				Rule* rule = parseRule(rulejson);
+				if (rule == NULL) {
+					continue;
+				}
 
+				FeatureLibraryItem* fitem = new FeatureLibraryItem();
+				fitem->author = item["author"];
+				fitem->name = item["name"];
+				fitem->describe = item["describe"];
+				fitem->rule = rule;
 
-	return NO_ERROR;
-}
+				nlohmann::json features = item["features"];
+				for (int y = 0; y < features.size(); y++) {
+					nlohmann::json feature = features[y];
+					if (feature.contains("key") && feature["key"].is_string()
+						&& (feature.contains("hex") && feature["hex"].is_string()
+							|| feature.contains("text") && feature["text"].is_string())) {
+						string fkey = feature["key"];
+						string fhex = "";
+						string ftext = "";
+						if (feature.contains("hex")) {
+							fhex = feature["hex"];
+						}
 
-FeatureLibrary FeatureLibrary::createByJson(string json, int* errorcode) {
-	FeatureLibrary result;
-	*errorcode = result.loadByJson(json);
+						if (feature.contains("text")) {
+							ftext = feature["text"];
+						}
+
+						Feature* feature = new Feature();
+						feature->key = fkey;
+						feature->hex = fhex;
+						feature->text = ftext;
+						fitem->features->push_back(feature);
+					}
+				}
+				result->items->push_back(fitem);
+			}
+		}
+	}
+
 	return result;
 }
 
+Rule* FeatureLibrary::parseRule(nlohmann::json rulejson) {
+	if (!rulejson.is_object()) {
+		return NULL;
+	}
 
-void FeatureLibrary::parseJson(std::vector<FeatureLibraryItem>* items, Json::Value values){
 
-	for (int i = 0; i < values.size(); i++) {
-		Json::Value value = values[i];
-		if (!value.isMember("content") || !value["content"].isString()
-			|| !value.isMember("name") || !value["name"].isString()
-			|| !value.isMember("describe") || !value["describe"].isString()) {
-			continue;
+	Rule* rule = new Rule();
+
+	if (rulejson.contains("$and")&&rulejson["$and"].is_array()&& rulejson["$and"].size()>0) {
+		nlohmann::json andr = rulejson["$and"];
+		nlohmann::json androne = andr[0];
+		rule->ands = new vector<Rule*>();
+		//说明是组合
+		if (androne.is_object()) {
+			for (int i = 0; i < andr.size(); i++) {
+				nlohmann::json tandr = andr[i];
+				Rule* tr = parseRule(tandr);
+				if (tr==NULL) {
+					continue;
+				}
+				rule->ands->push_back(tr);
+			}
 		}
+		//说明是id咯
+		else {
+			for (int i = 0; i < andr.size(); i++) {
+				nlohmann::json tandr = andr[i];
+				if (tandr.is_string()) {
+					string tid = tandr;
+					Rule* andids = new Rule();
+					andids->id = tid;
+					rule->ands->push_back(andids);
+				}
+			}
+		}
+	}
 
-		string name = value["name"].asString();
-		string describe = value["describe"].asString();
-		string content = value["content"].asString();
+	if (rulejson.contains("$or") && rulejson["$or"].is_array() && rulejson["$or"].size() > 0) {
+		nlohmann::json orr = rulejson["$or"];
+		nlohmann::json orrone = orr[0];
+		rule->ors = new vector<Rule*>();
+		//说明是组合
+		if (orrone.is_object()) {
+			for (int i = 0; i < orr.size(); i++) {
+				nlohmann::json torr = orr[i];
+				Rule* tr = parseRule(torr);
+				if (tr == NULL) {
+					continue;
+				}
+				rule->ors->push_back(tr);
+			}
+		}
+		//说明是id咯
+		else {
+			for (int i = 0; i < orr.size(); i++) {
+				nlohmann::json torr = orr[i];
+				if (torr.is_string()) {
+					string tid = torr;
 
-		FeatureLibraryItem item;
-		item.name = name;
-		item.describe = describe;
-		item.content = content;
+					Rule* orids = new Rule();
+					orids->id = tid;
+					rule->ors->push_back(orids);
+				}
+			}
+		}
+	}
 
-		items->push_back(item);
+	return rule;
+}
+
+
+FeatureLibraryItem::FeatureLibraryItem() {
+	features = new vector<Feature*>();
+}
+
+FeatureLibraryItem::~FeatureLibraryItem() {
+	if (features != NULL) {
+		for (int i = 0; i < features->size(); i++) {
+			Feature* content = features->at(i);
+			delete content;
+			content = NULL;
+		}
+	}
+	if (rule != NULL) {
+		delete rule;
+		rule = NULL;
 	}
 }
